@@ -9,7 +9,8 @@ and VLC's OpenGL ES output, on the GPU.
   WebPorn's WebCore (`MediaPlayerPrivateWebPorn`) dlopens it; no C++ crosses the boundary.
   It plays URLs, streams bytes fetched by WebCore's own loader (cookies, `blob:`, CORS),
   proxies HLS through that loader, muxes MSE source buffers into Matroska for VLC, renders
-  into a CALayer, gives canvas frames (`drawImage(video)`) and runs full screen in its own window.
+  into a CALayer, gives canvas frames (`drawImage(video)`) and runs full screen in its own window
+  (turns with the device; Done, play/pause, ±10 s, scrubber with elapsed / remaining time).
 - `MobileVLCKit.framework`: VideoLAN's MobileVLCKit 3.5.1, armv7 slice, install name moved
   to `/var/webporn/lib`.
 
@@ -18,8 +19,8 @@ MSE) 720p30 with seeking and audio.
 
 ## Install
 
-Release: [libvlc 1.0.0](https://github.com/wowodymyr/libvlc/releases/tag/1.0.0) —
-`net.webporn.libvlc_1.0.0_iphoneos-arm.deb`. Install it together with the `net.webporn`
+Release: [libvlc 1.0.1](https://github.com/wowodymyr/libvlc/releases/tag/1.0.1) —
+`net.webporn.libvlc_1.0.1_iphoneos-arm.deb`. Install it together with the `net.webporn`
 package (which depends on it) and TLSFix; see the WebPorn README. Files go to
 `/var/webporn/lib/libWebPornMedia.dylib` and `/var/webporn/lib/MobileVLCKit.framework/`.
 Without this package WebPorn runs without a media engine (no video or audio).

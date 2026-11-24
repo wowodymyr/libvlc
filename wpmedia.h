@@ -37,6 +37,9 @@ typedef enum {
 typedef enum {
     WPMEDIA_FULLSCREEN_EXIT, // the client should leave full screen (and call wpmedia_set_fullscreen 0)
     WPMEDIA_FULLSCREEN_TOGGLE_PLAYBACK,
+    // Seek to wpmedia_fullscreen_seek_time(). Sent only to clients that call
+    // wpmedia_set_fullscreen_state (the scrubber and skips are hidden otherwise).
+    WPMEDIA_FULLSCREEN_SEEK,
 } wpmedia_fullscreen_action;
 
 typedef struct {
@@ -123,9 +126,16 @@ void wpmedia_set_rate(wpmedia_player*, float rate);
 void wpmedia_set_volume(wpmedia_player*, float volume); // 0-1
 void wpmedia_set_muted(wpmedia_player*, int muted);
 
-// Shows the video in a window of its own over the whole screen (turned for a
-// landscape video; a tap shows Done and play/pause), or puts it back in its layer.
+// Shows the video in a window of its own over the whole screen (it turns with the
+// device; a tap shows Done, play/pause, 10 s skips and a scrubber), or puts it back
+// in its layer.
 void wpmedia_set_fullscreen(wpmedia_player*, int fullscreen);
+// Optional (same ABI version; look them up with dlsym): what the full-screen
+// controls show. Call on entering full screen and whenever time, duration (0 when
+// unknown / live) or play state change while in it.
+void wpmedia_set_fullscreen_state(wpmedia_player*, double time, double duration, int playing);
+// The time WPMEDIA_FULLSCREEN_SEEK asks for.
+double wpmedia_fullscreen_seek_time(wpmedia_player*);
 // The current video frame as a CGImageRef (+1, the caller releases it), at most
 // max_width pixels wide, or NULL. Blocks for a few hundred milliseconds
 // (libVLC's snapshot: the frame is read back from the GPU); cache it.

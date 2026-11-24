@@ -1,6 +1,6 @@
 Package: net.webporn.libvlc
 Name: libvlc (WebPorn media)
-Version: 1.0.0
+Version: 1.0.1
 Architecture: iphoneos-arm
 Description: libVLC 3.0.18 media engine for WebPorn: <video>, <audio>, HLS and Media Source Extensions (YouTube) through VLC, played on the GPU.
 Depends: firmware (>= 8.0)

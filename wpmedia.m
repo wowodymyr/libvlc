@@ -56,104 +56,448 @@ static void debugLog(const char* format, ...)
 
 // MARK: - Host layer
 
-// The full-screen window: black, the video turned to landscape when it is wider
-// than the portrait screen, and a bar (Done, play/pause) a tap shows for a while.
+// The full-screen window: black, the video scaled to fit, and controls like
+// iOS's own player that a tap shows and hides: Done at the top, play/pause and
+// 10 s skips in the middle, elapsed time / scrubber / remaining time at the
+// bottom. Its view controller turns with the device: a window without one is
+// laid out in landscape screen coordinates but drawn in portrait on iOS 8 (half
+// the video at the left, the rest off screen). Time, duration and state come
+// from the client (wpmedia_set_fullscreen_state); until they do (an older
+// client), only Done and play/pause are shown.
+
+typedef enum { WPIconPlay, WPIconPause, WPIconSkipBack, WPIconSkipForward } WPIcon;
+
+@interface WPIconButton : UIButton
+@property (nonatomic) WPIcon icon;
+@property (nonatomic, strong) CAShapeLayer* shape;
+@property (nonatomic, strong) UILabel* label;
+@property (nonatomic) BOOL round;
+@end
+
+@implementation WPIconButton
+
+- (instancetype)initWithIcon:(WPIcon)icon round:(BOOL)round
+{
+    if (!(self = [super initWithFrame:CGRectZero]))
+        return nil;
+    _round = round;
+    _shape = [CAShapeLayer layer];
+    _shape.fillColor = [UIColor whiteColor].CGColor;
+    _shape.strokeColor = [UIColor whiteColor].CGColor;
+    [self.layer addSublayer:_shape];
+    if (round)
+        self.backgroundColor = [UIColor colorWithWhite:0 alpha:0.35];
+    if (icon == WPIconSkipBack || icon == WPIconSkipForward) {
+        _label = [[UILabel alloc] init];
+        _label.text = @"10";
+        _label.textColor = [UIColor whiteColor];
+        _label.font = [UIFont boldSystemFontOfSize:11];
+        _label.textAlignment = NSTextAlignmentCenter;
+        _label.userInteractionEnabled = NO;
+        [self addSubview:_label];
+    }
+    self.icon = icon;
+    return self;
+}
+
+- (void)setIcon:(WPIcon)icon
+{
+    _icon = icon;
+    [self setNeedsLayout];
+}
+
+- (void)setHighlighted:(BOOL)highlighted
+{
+    [super setHighlighted:highlighted];
+    self.alpha = highlighted ? 0.5 : 1;
+}
+
+- (void)layoutSubviews
+{
+    [super layoutSubviews];
+    CGRect b = self.bounds;
+    CGFloat s = MIN(b.size.width, b.size.height);
+    CGPoint c = CGPointMake(CGRectGetMidX(b), CGRectGetMidY(b));
+    if (self.round)
+        self.layer.cornerRadius = s / 2;
+    UIBezierPath* path = [UIBezierPath bezierPath];
+    self.shape.lineWidth = 0;
+    switch (self.icon) {
+    case WPIconPlay: {
+        CGFloat h = s * 0.4, w = h * 0.87;
+        CGFloat x = c.x - w / 2 + s * 0.04;
+        [path moveToPoint:CGPointMake(x, c.y - h / 2)];
+        [path addLineToPoint:CGPointMake(x + w, c.y)];
+        [path addLineToPoint:CGPointMake(x, c.y + h / 2)];
+        [path closePath];
+        break;
+    }
+    case WPIconPause: {
+        CGFloat h = s * 0.38, w = s * 0.11, gap = s * 0.1;
+        [path appendPath:[UIBezierPath bezierPathWithRoundedRect:CGRectMake(c.x - gap / 2 - w, c.y - h / 2, w, h) cornerRadius:w * 0.2]];
+        [path appendPath:[UIBezierPath bezierPathWithRoundedRect:CGRectMake(c.x + gap / 2, c.y - h / 2, w, h) cornerRadius:w * 0.2]];
+        break;
+    }
+    case WPIconSkipBack:
+    case WPIconSkipForward: {
+        // A clockwise arc from the top right around to the top, where it ends in
+        // an arrowhead pointing into the gap; "10" inside. The back icon is its
+        // mirror image.
+        CGFloat r = s * 0.36, a = s * 0.13, gap = 0.85;
+        UIBezierPath* arc = [UIBezierPath bezierPathWithArcCenter:c radius:r startAngle:-M_PI_2 + gap endAngle:3 * M_PI_2 clockwise:YES];
+        CGPathRef stroked = CGPathCreateCopyByStrokingPath(arc.CGPath, NULL, s * 0.075, kCGLineCapButt, kCGLineJoinRound, 0);
+        [path appendPath:[UIBezierPath bezierPathWithCGPath:stroked]];
+        CGPathRelease(stroked);
+        [path moveToPoint:CGPointMake(c.x + a * 1.1, c.y - r)];
+        [path addLineToPoint:CGPointMake(c.x - a * 0.15, c.y - r - a * 0.9)];
+        [path addLineToPoint:CGPointMake(c.x - a * 0.15, c.y - r + a * 0.9)];
+        [path closePath];
+        if (self.icon == WPIconSkipBack) {
+            CGAffineTransform mirror = CGAffineTransformMake(-1, 0, 0, 1, 2 * c.x, 0);
+            [path applyTransform:mirror];
+        }
+        self.label.frame = CGRectMake(c.x - r, c.y - r + s * 0.02, 2 * r, 2 * r);
+        self.label.font = [UIFont systemFontOfSize:floor(s * 0.3)];
+        break;
+    }
+    }
+    self.shape.frame = b;
+    self.shape.path = path.CGPath;
+}
+
+@end
+
+static NSString* formatTime(double seconds)
+{
+    if (!isfinite(seconds) || seconds < 0)
+        seconds = 0;
+    long total = (long)floor(seconds + 0.5);
+    if (total >= 3600)
+        return [NSString stringWithFormat:@"%ld:%02ld:%02ld", total / 3600, total / 60 % 60, total % 60];
+    return [NSString stringWithFormat:@"%ld:%02ld", total / 60, total % 60];
+}
+
+static UIImage* sliderThumbImage(void)
+{
+    CGFloat d = 14;
+    UIGraphicsBeginImageContextWithOptions(CGSizeMake(d + 4, d + 4), NO, 0);
+    CGContextRef context = UIGraphicsGetCurrentContext();
+    CGContextSetShadowWithColor(context, CGSizeMake(0, 1), 2, [UIColor colorWithWhite:0 alpha:0.4].CGColor);
+    [[UIColor whiteColor] setFill];
+    [[UIBezierPath bezierPathWithOvalInRect:CGRectMake(2, 2, d, d)] fill];
+    UIImage* image = UIGraphicsGetImageFromCurrentImageContext();
+    UIGraphicsEndImageContext();
+    return image;
+}
+
+@interface WPFullscreenController : UIViewController <UIGestureRecognizerDelegate>
+@property (nonatomic, copy) void (^action)(wpmedia_fullscreen_action, double);
+@property (nonatomic, strong) UIView* videoContainer;
+@property (nonatomic, strong) UIView* controls;
+@property (nonatomic, strong) CAGradientLayer* topShade;
+@property (nonatomic, strong) CAGradientLayer* bottomShade;
+@property (nonatomic, strong) UIButton* done;
+@property (nonatomic, strong) WPIconButton* playback;
+@property (nonatomic, strong) WPIconButton* skipBack;
+@property (nonatomic, strong) WPIconButton* skipForward;
+@property (nonatomic, strong) UISlider* scrubber;
+@property (nonatomic, strong) UILabel* elapsed;
+@property (nonatomic, strong) UILabel* remaining;
+@property (nonatomic) BOOL hasState;
+@property (nonatomic) BOOL playing;
+@property (nonatomic) double currentTime;
+@property (nonatomic) double duration;
+@property (nonatomic) BOOL scrubbing;
+@property (nonatomic) CFAbsoluteTime ignoreStateUntil;
+- (void)setTime:(double)time duration:(double)duration playing:(BOOL)playing;
+@end
+
+@implementation WPFullscreenController
+
+- (void)loadView
+{
+    UIView* view = [[UIView alloc] initWithFrame:[UIScreen mainScreen].bounds];
+    view.backgroundColor = [UIColor blackColor];
+    self.view = view;
+
+    _videoContainer = [[UIView alloc] initWithFrame:view.bounds];
+    _videoContainer.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    _videoContainer.backgroundColor = [UIColor blackColor];
+    // libVLC's video view has a tap recognizer of its own (mouse events for the
+    // vout) that would win over ours once the controls are hidden.
+    _videoContainer.userInteractionEnabled = NO;
+    [view addSubview:_videoContainer];
+
+    _controls = [[UIView alloc] initWithFrame:view.bounds];
+    _controls.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [view addSubview:_controls];
+
+    _topShade = [CAGradientLayer layer];
+    _topShade.colors = @[ (id)[UIColor colorWithWhite:0 alpha:0.6].CGColor, (id)[UIColor colorWithWhite:0 alpha:0].CGColor ];
+    [_controls.layer addSublayer:_topShade];
+    _bottomShade = [CAGradientLayer layer];
+    _bottomShade.colors = @[ (id)[UIColor colorWithWhite:0 alpha:0].CGColor, (id)[UIColor colorWithWhite:0 alpha:0.7].CGColor ];
+    [_controls.layer addSublayer:_bottomShade];
+
+    _done = [UIButton buttonWithType:UIButtonTypeSystem];
+    _done.tintColor = [UIColor whiteColor];
+    _done.titleLabel.font = [UIFont boldSystemFontOfSize:17];
+    NSString* doneTitle = [[NSBundle bundleForClass:[UIApplication class]] localizedStringForKey:@"Done" value:@"Done" table:nil];
+    [_done setTitle:doneTitle forState:UIControlStateNormal];
+    _done.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
+    [_done addTarget:self action:@selector(doneTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_controls addSubview:_done];
+
+    _playback = [[WPIconButton alloc] initWithIcon:WPIconPause round:YES];
+    [_playback addTarget:self action:@selector(playbackTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_controls addSubview:_playback];
+    _skipBack = [[WPIconButton alloc] initWithIcon:WPIconSkipBack round:NO];
+    [_skipBack addTarget:self action:@selector(skipBackTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_controls addSubview:_skipBack];
+    _skipForward = [[WPIconButton alloc] initWithIcon:WPIconSkipForward round:NO];
+    [_skipForward addTarget:self action:@selector(skipForwardTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_controls addSubview:_skipForward];
+
+    _scrubber = [[UISlider alloc] init];
+    _scrubber.minimumTrackTintColor = [UIColor whiteColor];
+    _scrubber.maximumTrackTintColor = [UIColor colorWithWhite:1 alpha:0.3];
+    [_scrubber setThumbImage:sliderThumbImage() forState:UIControlStateNormal];
+    [_scrubber addTarget:self action:@selector(scrubStarted) forControlEvents:UIControlEventTouchDown];
+    [_scrubber addTarget:self action:@selector(scrubMoved) forControlEvents:UIControlEventValueChanged];
+    [_scrubber addTarget:self action:@selector(scrubEnded) forControlEvents:UIControlEventTouchUpInside | UIControlEventTouchUpOutside | UIControlEventTouchCancel];
+    [_controls addSubview:_scrubber];
+    _elapsed = [self timeLabel];
+    _elapsed.textAlignment = NSTextAlignmentRight;
+    [_controls addSubview:_elapsed];
+    _remaining = [self timeLabel];
+    _remaining.textAlignment = NSTextAlignmentLeft;
+    [_controls addSubview:_remaining];
+
+    UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped:)];
+    tap.delegate = self;
+    [view addGestureRecognizer:tap];
+
+    _playing = YES;
+    [self updateControls];
+}
+
+- (UILabel*)timeLabel
+{
+    UILabel* label = [[UILabel alloc] init];
+    label.textColor = [UIColor whiteColor];
+    label.font = [UIFont systemFontOfSize:13];
+    label.shadowColor = [UIColor colorWithWhite:0 alpha:0.4];
+    label.shadowOffset = CGSizeMake(0, 1);
+    return label;
+}
+
+- (void)viewDidLoad
+{
+    [super viewDidLoad];
+    [self hideControlsLater];
+}
+
+- (BOOL)prefersStatusBarHidden { return YES; }
+- (BOOL)shouldAutorotate { return YES; }
+- (UIInterfaceOrientationMask)supportedInterfaceOrientations { return UIInterfaceOrientationMaskAllButUpsideDown; }
+
+- (void)viewDidLayoutSubviews
+{
+    [super viewDidLayoutSubviews];
+    CGRect b = self.view.bounds;
+    CGFloat w = b.size.width, h = b.size.height;
+    [CATransaction begin];
+    [CATransaction setDisableActions:YES];
+    self.topShade.frame = CGRectMake(0, 0, w, 80);
+    self.bottomShade.frame = CGRectMake(0, h - 90, w, 90);
+    [CATransaction commit];
+
+    // libVLC's OpenGL view does not autoresize with the drawable (layoutSublayers).
+    for (UIView* drawable in self.videoContainer.subviews) {
+        drawable.frame = self.videoContainer.bounds;
+        for (UIView* subview in drawable.subviews)
+            subview.frame = drawable.bounds;
+    }
+
+    self.done.frame = CGRectMake(16, 10, 120, 44);
+    CGFloat big = 72, small = 52, spread = MIN(w, h) < 400 ? 96 : 120;
+    self.playback.frame = CGRectMake(floor(w / 2 - big / 2), floor(h / 2 - big / 2), big, big);
+    self.skipBack.frame = CGRectMake(floor(w / 2 - spread - small / 2), floor(h / 2 - small / 2), small, small);
+    self.skipForward.frame = CGRectMake(floor(w / 2 + spread - small / 2), floor(h / 2 - small / 2), small, small);
+
+    CGFloat labelWidth = self.duration >= 3600 ? 62 : 46, y = h - 44;
+    self.elapsed.frame = CGRectMake(12, y, labelWidth, 30);
+    self.remaining.frame = CGRectMake(w - 12 - labelWidth, y, labelWidth, 30);
+    self.scrubber.frame = CGRectMake(12 + labelWidth + 10, y, w - 2 * (12 + labelWidth + 10), 30);
+}
+
+- (void)updateControls
+{
+    self.playback.icon = self.playing ? WPIconPause : WPIconPlay;
+    BOOL seekable = self.hasState && self.duration > 0 && isfinite(self.duration);
+    self.scrubber.hidden = self.elapsed.hidden = self.remaining.hidden = !seekable;
+    self.skipBack.hidden = self.skipForward.hidden = !seekable;
+    if (!seekable)
+        return;
+    double shown = self.scrubbing ? self.scrubber.value * self.duration : self.currentTime;
+    if (!self.scrubbing)
+        self.scrubber.value = self.duration > 0 ? MIN(MAX(self.currentTime / self.duration, 0), 1) : 0;
+    self.elapsed.text = formatTime(shown);
+    self.remaining.text = [@"-" stringByAppendingString:formatTime(self.duration - shown)];
+}
+
+- (void)setTime:(double)time duration:(double)duration playing:(BOOL)playing
+{
+    BOOL layout = (duration >= 3600) != (self.duration >= 3600);
+    // A seek or play/pause the viewer just asked for: keep showing it until the
+    // client has caught up.
+    BOOL fresh = CFAbsoluteTimeGetCurrent() >= self.ignoreStateUntil;
+    if (fresh) {
+        self.currentTime = time;
+        if (self.playing != playing) {
+            self.playing = playing;
+            [self hideControlsLater];
+        }
+    }
+    self.duration = duration;
+    self.hasState = YES;
+    if (layout)
+        [self.view setNeedsLayout];
+    [self updateControls];
+}
+
+- (void)send:(wpmedia_fullscreen_action)action value:(double)value
+{
+    if (self.action)
+        self.action(action, value);
+}
+
+- (void)doneTapped
+{
+    debugLog("fullscreen: done");
+    [self send:WPMEDIA_FULLSCREEN_EXIT value:0];
+}
+
+- (void)playbackTapped
+{
+    debugLog("fullscreen: play/pause");
+    self.playing = !self.playing;
+    self.ignoreStateUntil = CFAbsoluteTimeGetCurrent() + 1;
+    [self updateControls];
+    [self send:WPMEDIA_FULLSCREEN_TOGGLE_PLAYBACK value:0];
+    [self hideControlsLater];
+}
+
+- (void)seekTo:(double)time
+{
+    time = MIN(MAX(time, 0), self.duration);
+    debugLog("fullscreen: seek to %.1f", time);
+    self.currentTime = time;
+    self.ignoreStateUntil = CFAbsoluteTimeGetCurrent() + 1.5;
+    [self updateControls];
+    [self send:WPMEDIA_FULLSCREEN_SEEK value:time];
+    [self hideControlsLater];
+}
+
+- (void)skipBackTapped { [self seekTo:self.currentTime - 10]; }
+- (void)skipForwardTapped { [self seekTo:self.currentTime + 10]; }
+
+- (void)scrubStarted
+{
+    self.scrubbing = YES;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideControls) object:nil];
+}
+
+- (void)scrubMoved
+{
+    [self updateControls];
+}
+
+- (void)scrubEnded
+{
+    self.scrubbing = NO;
+    [self seekTo:self.scrubber.value * self.duration];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer shouldReceiveTouch:(UITouch*)touch
+{
+    return ![touch.view isKindOfClass:[UIControl class]];
+}
+
+- (BOOL)gestureRecognizer:(UIGestureRecognizer*)recognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)other
+{
+    return YES;
+}
+
+- (void)tapped:(UITapGestureRecognizer*)tap
+{
+    [self setControlsShown:self.controls.alpha < 0.5];
+}
+
+- (void)setControlsShown:(BOOL)shown
+{
+    self.controls.userInteractionEnabled = shown;
+    [UIView animateWithDuration:0.25 animations:^{
+        self.controls.alpha = shown ? 1 : 0;
+    }];
+    [self hideControlsLater];
+}
+
+- (void)hideControlsLater
+{
+    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideControls) object:nil];
+    if (self.controls.alpha > 0.5 && self.playing && !self.scrubbing)
+        [self performSelector:@selector(hideControls) withObject:nil afterDelay:3];
+}
+
+- (void)hideControls
+{
+    if (self.playing && !self.scrubbing)
+        [self setControlsShown:NO];
+}
+
+@end
+
 @interface WPFullscreenWindow : UIWindow
-@property (nonatomic, copy) void (^action)(wpmedia_fullscreen_action);
-@property (nonatomic, strong) UIView* content;
-@property (nonatomic, strong) UIView* bar;
+@property (nonatomic, strong) WPFullscreenController* controller;
+@property (nonatomic, weak) UIWindow* previousKeyWindow;
 - (instancetype)initWithVideoSize:(CGSize)size;
 - (void)showVideoView:(UIView*)view;
+- (void)dismiss;
 @end
 
 @implementation WPFullscreenWindow
 
 - (instancetype)initWithVideoSize:(CGSize)size
 {
-    CGRect bounds = [UIScreen mainScreen].bounds;
-    if (!(self = [super initWithFrame:bounds]))
+    if (!(self = [super initWithFrame:[UIScreen mainScreen].bounds]))
         return nil;
     self.windowLevel = UIWindowLevelStatusBar + 1;
     self.backgroundColor = [UIColor blackColor];
-    BOOL landscape = size.width > size.height && bounds.size.height > bounds.size.width;
-    _content = [[UIView alloc] initWithFrame:landscape ? CGRectMake(0, 0, bounds.size.height, bounds.size.width) : bounds];
-    _content.center = CGPointMake(CGRectGetMidX(bounds), CGRectGetMidY(bounds));
-    if (landscape)
-        _content.transform = CGAffineTransformMakeRotation(M_PI_2);
-    _content.backgroundColor = [UIColor blackColor];
-    [self addSubview:_content];
-
-    _bar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, _content.bounds.size.width, 44)];
-    _bar.backgroundColor = [UIColor colorWithWhite:0 alpha:0.6];
-    _bar.autoresizingMask = UIViewAutoresizingFlexibleWidth;
-    UIButton* done = [UIButton buttonWithType:UIButtonTypeSystem];
-    done.frame = CGRectMake(8, 0, 80, 44);
-    done.tintColor = [UIColor whiteColor];
-    done.titleLabel.font = [UIFont boldSystemFontOfSize:17];
-    [done setTitle:@"Done" forState:UIControlStateNormal];
-    done.contentHorizontalAlignment = UIControlContentHorizontalAlignmentLeft;
-    [done addTarget:self action:@selector(done) forControlEvents:UIControlEventTouchUpInside];
-    [_bar addSubview:done];
-    UIButton* playback = [UIButton buttonWithType:UIButtonTypeSystem];
-    playback.frame = CGRectMake((_bar.bounds.size.width - 120) / 2, 0, 120, 44);
-    playback.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin | UIViewAutoresizingFlexibleRightMargin;
-    playback.tintColor = [UIColor whiteColor];
-    playback.titleLabel.font = [UIFont systemFontOfSize:22];
-    [playback setTitle:@"\u25B6\uFE0E \u275A\u275A" forState:UIControlStateNormal];
-    [playback addTarget:self action:@selector(togglePlayback) forControlEvents:UIControlEventTouchUpInside];
-    [_bar addSubview:playback];
-    [_content addSubview:_bar];
-
-    UITapGestureRecognizer* tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(tapped:)];
-    [_content addGestureRecognizer:tap];
-    [self hideBarLater];
+    _controller = [[WPFullscreenController alloc] init];
+    self.rootViewController = _controller;
     return self;
 }
 
 - (void)showVideoView:(UIView*)view
 {
-    view.frame = self.content.bounds;
+    (void)self.controller.view; // loadView: the container exists only after it
+    UIView* container = self.controller.videoContainer;
+    view.frame = container.bounds;
     view.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
-    [self.content insertSubview:view belowSubview:self.bar];
+    [container addSubview:view];
     for (UIView* subview in view.subviews)
         subview.frame = view.bounds;
+    self.previousKeyWindow = [UIApplication sharedApplication].keyWindow;
+    [self makeKeyAndVisible];
 }
 
-- (void)tapped:(UITapGestureRecognizer*)tap
+- (void)dismiss
 {
-    CGPoint point = [tap locationInView:self.content];
-    debugLog("fullscreen tap at %.0f,%.0f (window %.0f,%.0f), bar %s", point.x, point.y, [tap locationInView:self].x, [tap locationInView:self].y, self.bar.hidden ? "hidden" : "shown");
-    if (!self.bar.hidden && CGRectContainsPoint(self.bar.frame, [tap locationInView:self.content]))
-        return;
-    self.bar.hidden = !self.bar.hidden;
-    [self hideBarLater];
-}
-
-- (void)hideBarLater
-{
-    [NSObject cancelPreviousPerformRequestsWithTarget:self selector:@selector(hideBar) object:nil];
-    if (!self.bar.hidden)
-        [self performSelector:@selector(hideBar) withObject:nil afterDelay:3];
-}
-
-- (void)hideBar
-{
-    self.bar.hidden = YES;
-}
-
-- (void)done
-{
-    debugLog("fullscreen: done");
-    if (self.action)
-        self.action(WPMEDIA_FULLSCREEN_EXIT);
-}
-
-- (void)togglePlayback
-{
-    debugLog("fullscreen: play/pause");
-    if (self.action)
-        self.action(WPMEDIA_FULLSCREEN_TOGGLE_PLAYBACK);
-    [self hideBarLater];
+    self.controller.action = nil;
+    [NSObject cancelPreviousPerformRequestsWithTarget:self.controller];
+    self.hidden = YES;
+    [self.previousKeyWindow makeKeyWindow];
 }
 
 @end
@@ -173,7 +517,6 @@ static void debugLog(const char* format, ...)
     WPFullscreenWindow* window = self.fullscreenWindow;
     if (!window)
         return;
-    window.action = nil;
     self.fullscreenWindow = nil;
     UIView* drawable = self.drawable;
     if (drawable) {
@@ -181,7 +524,7 @@ static void debugLog(const char* format, ...)
         drawable.autoresizingMask = UIViewAutoresizingNone;
         [self addSublayer:drawable.layer];
     }
-    window.hidden = YES;
+    [window dismiss];
     [self setNeedsLayout];
 }
 
@@ -248,6 +591,7 @@ struct wpmedia_player {
     float rate;
     double duration;
     unsigned width, height;
+    double fullscreenSeekTime; // the full-screen scrubber's target (WPMEDIA_FULLSCREEN_SEEK)
     int hasVideo, hasAudio;
 };
 
@@ -1264,7 +1608,9 @@ void wpmedia_set_fullscreen(wpmedia_player* p, int fullscreen)
         if (layer.fullscreenWindow || !layer.drawable)
             return;
         WPFullscreenWindow* window = [[WPFullscreenWindow alloc] initWithVideoSize:size];
-        window.action = ^(wpmedia_fullscreen_action action) {
+        window.controller.action = ^(wpmedia_fullscreen_action action, double value) {
+            if (action == WPMEDIA_FULLSCREEN_SEEK)
+                p->fullscreenSeekTime = value;
             dispatch_async(queue, ^{
                 if (target->valid && target->client.fullscreen_action)
                     target->client.fullscreen_action(target->client.context, action);
@@ -1273,9 +1619,21 @@ void wpmedia_set_fullscreen(wpmedia_player* p, int fullscreen)
         layer.fullscreenWindow = window;
         [layer.drawable.layer removeFromSuperlayer];
         [window showVideoView:layer.drawable];
-        window.hidden = NO;
         debugLog("fullscreen %.0fx%.0f", size.width, size.height);
     });
+}
+
+void wpmedia_set_fullscreen_state(wpmedia_player* p, double time, double duration, int playing)
+{
+    WPMediaLayer* layer = (__bridge WPMediaLayer*)p->layer;
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [layer.fullscreenWindow.controller setTime:time duration:duration playing:playing];
+    });
+}
+
+double wpmedia_fullscreen_seek_time(wpmedia_player* p)
+{
+    return p->fullscreenSeekTime;
 }
 
 void* wpmedia_layer(wpmedia_player* p)
